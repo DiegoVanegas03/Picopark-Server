@@ -1,0 +1,474 @@
+package org.example;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import org.java_websocket.WebSocket;
+import org.java_websocket.handshake.ClientHandshake;
+import org.java_websocket.server.WebSocketServer;
+
+import java.io.File;
+import java.net.InetSocketAddress;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+import static org.example.GameRoom.loadMap;
+
+public class GameWebSocketServer extends WebSocketServer {
+
+    private final Gson gson = new Gson();
+    private final Map<String, User> users = new ConcurrentHashMap<>();
+    private final Map<String, GameRoom> rooms = new ConcurrentHashMap<>();
+    private final Map<WebSocket, String> connectionToUserId = new ConcurrentHashMap<>();
+
+
+    private static final float GRAVITY = 0.5f;
+    private static final float JUMP_FORCE = -9f;
+
+    //velociadad para 60
+    private static final float MOVE_SPEED = 5f;
+    private static final int GAME_TICK_RATE = 60; // 60 FPS
+
+    //private static final float MOVE_SPEED = 2f;
+    //private static final int GAME_TICK_RATE = 120; // 60 FPS
+
+    private static final int ORIGINAL_SIZE_TILE = 16;
+    private static final int SCALE = 3;
+    private static final int SIZE_TILE = ORIGINAL_SIZE_TILE * SCALE; // 48 pixels
+
+    private static final Set<Integer> SOLID_TILES = Set.of(3, 4, 5);
+
+    public GameWebSocketServer(int port) {
+        super(new InetSocketAddress(port));
+        initializeRooms();
+        startGameLoop();
+    }
+
+    private void initializeRooms() {
+        File levelsDir = new File("maps");
+
+        String[] salas = levelsDir.list((dir, name) -> name.endsWith(".txt"));
+        if (salas == null) return;
+
+        for (String sala : salas) {
+
+            File mapFile = new File(levelsDir, sala);
+
+            GameRoom.MapData mapData = GameRoom.loadMap(mapFile);
+
+            String roomId = sala.replace(".txt", "");
+
+            rooms.put(roomId, new GameRoom(
+                    roomId,
+                    mapData.levelName,   // ← ahora le pones el nombre del txt
+                    mapData.world        // ← y su matriz del mapa
+            ));
+        }
+    }
+
+
+    @Override
+    public void onOpen(WebSocket conn, ClientHandshake handshake) {
+        System.out.println("Nueva conexión: " + conn.getRemoteSocketAddress());
+    }
+
+    @Override
+    public void onClose(WebSocket conn, int code, String reason, boolean remote) {
+        String userId = connectionToUserId.remove(conn);
+        if (userId != null) {
+            User user = users.remove(userId);
+            if (user != null && user.currentRoom != null) {
+                GameRoom room = rooms.get(user.currentRoom);
+                if (room != null) {
+                    room.removePlayer(userId);
+                    broadcastToRoom(user.currentRoom, createMessage("playerLeft", Map.of(
+                            "userId", userId,
+                            "username", user.username
+                    )));
+                }
+            }
+        }
+        System.out.println("Conexión cerrada: " + conn.getRemoteSocketAddress());
+    }
+
+    @Override
+    public void onMessage(WebSocket conn, String message) {
+        try {
+
+            System.out.println("Mensaje recibido: " + message);
+            JsonObject json = JsonParser.parseString(message).getAsJsonObject();
+            String type = json.get("type").getAsString();
+
+            JsonObject data = json.getAsJsonObject("data");
+
+            switch (type) {
+                case "auth":
+                    handleAuth(conn, data);
+                    break;
+                case "joinRoom":
+                    handleJoinRoom(conn, data);
+                    break;
+                case "move":
+                    handleMove(conn, data);
+                    break;
+                case "jump":
+                    handleJump(conn);
+                    break;
+                case "chat":
+                    handleChat(conn, data);
+                    break;
+                default:
+                    sendError(conn, "Tipo de mensaje desconocido");
+            }
+        } catch (Exception e) {
+            sendError(conn, "Error procesando mensaje: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void onError(WebSocket conn, Exception ex) {
+        System.err.println("Error: " + ex.getMessage());
+        ex.printStackTrace();
+    }
+
+    @Override
+    public void onStart() {
+        System.out.println("Servidor WebSocket iniciado en puerto " + getPort());
+        System.out.println("Esperando conexiones...");
+    }
+
+    private void handleAuth(WebSocket conn, JsonObject data) {
+        String username = data.get("username").getAsString();
+        String password = data.get("password").getAsString();
+
+        // Autenticación simple (en producción usar hash y base de datos)
+        if (authenticateUser(username, password)) {
+            String userId = UUID.randomUUID().toString();
+            User user = new User(userId, username, conn);
+            users.put(userId, user);
+            connectionToUserId.put(conn, userId);
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("userId", userId);
+            response.put("username", username);
+            response.put("rooms", getRoomsList());
+
+            sendToClient(conn, createMessage("authSuccess", response));
+            System.out.println("Usuario autenticado: " + username);
+        } else {
+            sendToClient(conn, createMessage("authFailed", Map.of("reason", "Credenciales inválidas")));
+        }
+    }
+
+    private boolean authenticateUser(String username, String password) {
+        // Autenticación simple de ejemplo
+        // En producción: verificar contra base de datos con hash bcrypt
+        return username.length() >= 3 && password.length() >= 4;
+    }
+
+    private void handleJoinRoom(WebSocket conn, JsonObject data) {
+        String userId = connectionToUserId.get(conn);
+        if (userId == null) {
+            sendError(conn, "No autenticado");
+            return;
+        }
+
+        User user = users.get(userId);
+        String roomId = data.get("roomId").getAsString();
+        GameRoom room = rooms.get(roomId);
+
+        if (room == null) {
+            sendError(conn, "Sala no encontrada");
+            return;
+        }
+
+        // Salir de la sala anterior si existe
+        if (user.currentRoom != null) {
+            GameRoom oldRoom = rooms.get(user.currentRoom);
+            if (oldRoom != null) {
+                oldRoom.removePlayer(userId);
+                broadcastToRoom(user.currentRoom, createMessage("playerLeft", Map.of(
+                        "userId", userId,
+                        "username", user.username
+                )));
+            }
+        }
+
+        // Unirse a la nueva sala
+        user.currentRoom = roomId;
+        Player player = new Player(userId, user.username);
+        room.addPlayer(player);
+
+        // Enviar estado actual de la sala al jugador
+        sendToClient(conn, createMessage("roomJoined", Map.of(
+                "roomId", roomId,
+                "roomName", room.name,
+                "players", room.getPlayersData(),
+                "world" , room.world
+        )));
+
+        // Notificar a otros jugadores
+        broadcastToRoomExcept(roomId, userId, createMessage("playerJoined", Map.of(
+                "userId", userId,
+                "username", user.username,
+                "player", player.toMap()
+        )));
+    }
+
+    private void handleMove(WebSocket conn, JsonObject data) {
+        String userId = connectionToUserId.get(conn);
+        if (userId == null) return;
+
+        User user = users.get(userId);
+        if (user.currentRoom == null) return;
+
+        GameRoom room = rooms.get(user.currentRoom);
+        Player player = room.getPlayer(userId);
+
+        if (player != null) {
+            String direction = data.get("direction").getAsString();
+            player.direction = direction;
+            player.moveDirection = direction.equals("left") ? -1 : (direction.equals("right") ? 1 : 0);
+        }
+    }
+
+    private void handleJump(WebSocket conn) {
+        String userId = connectionToUserId.get(conn);
+        if (userId == null) return;
+
+        User user = users.get(userId);
+        if (user.currentRoom == null) return;
+
+        GameRoom room = rooms.get(user.currentRoom);
+        Player player = room.getPlayer(userId);
+
+        if (player != null && player.isOnGround) {
+            player.velocityY = JUMP_FORCE;
+            player.isOnGround = false;
+        }
+    }
+
+    private void handleChat(WebSocket conn, JsonObject data) {
+        String userId = connectionToUserId.get(conn);
+        if (userId == null) return;
+
+        User user = users.get(userId);
+        String message = data.get("message").getAsString();
+
+        if (user.currentRoom != null) {
+            broadcastToRoom(user.currentRoom, createMessage("chat", Map.of(
+                    "userId", userId,
+                    "username", user.username,
+                    "message", message
+            )));
+        }
+    }
+
+    private void startGameLoop() {
+        Timer timer = new Timer();
+        timer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                updateGame();
+            }
+        }, 0, 1000 / GAME_TICK_RATE);
+    }
+
+    private void updateGame() {
+        for (GameRoom room : rooms.values()) {
+            if (room.players.isEmpty()) continue;
+
+            for (Player player : room.players.values()) {
+                // ========== MOVIMIENTO HORIZONTAL ==========
+                player.x += player.moveDirection * MOVE_SPEED;
+
+                // Verificar colisión horizontal
+                if (checkCollisionHorizontal(player, room.world)) {
+                    player.x -= player.moveDirection * MOVE_SPEED; // Revertir
+                }
+
+                // Limitar a los límites del mundo
+                player.x = Math.max(0, Math.min(room.world[0].length * SIZE_TILE - player.width, player.x));
+
+                // ========== MOVIMIENTO VERTICAL ==========
+                // Aplicar gravedad
+                player.velocityY += GRAVITY;
+
+                // Limitar velocidad máxima de caída
+                if (player.velocityY > 15) {
+                    player.velocityY = 15;
+                }
+
+                player.y += player.velocityY;
+
+                // Verificar colisión hacia abajo (suelo)
+                if (player.velocityY > 0 && checkCollisionDown(player, room.world)) {
+                    // Ajustar posición al tile más cercano
+                    int bottomPixel = (int)(player.y + player.height);
+                    int tileY = bottomPixel / SIZE_TILE;
+                    player.y = (tileY * SIZE_TILE) - player.height;
+
+                    player.velocityY = 0;
+                    player.isOnGround = true;
+                }
+                // Verificar colisión hacia arriba (techo)
+                else if (player.velocityY < 0 && checkCollisionUp(player, room.world)) {
+                    int topPixel = (int)player.y;
+                    int tileY = (topPixel / SIZE_TILE) + 1;
+                    player.y = tileY * SIZE_TILE;
+
+                    player.velocityY = 0;
+                }
+                else {
+                    // No hay colisión, está en el aire
+                    player.isOnGround = false;
+                }
+            }
+
+            // Enviar actualización a todos los jugadores en la sala
+            broadcastToRoom(room.id, createMessage("gameUpdate", Map.of(
+                    "players", room.getPlayersData()
+            )));
+        }
+    }
+
+    private boolean checkCollisionHorizontal(Player player, int[][] world) {
+        int topTile = (int)(player.y / SIZE_TILE);
+        int bottomTile = (int)((player.y + player.height - 1) / SIZE_TILE);
+        int leftTile = (int)(player.x / SIZE_TILE);
+        int rightTile = (int)((player.x + player.width - 1) / SIZE_TILE);
+
+        // Verificar límites
+        if (leftTile < 0 || rightTile >= world[0].length) {
+            return true;
+        }
+        if (topTile < 0 || bottomTile >= world.length) {
+            return false;
+        }
+
+        // Verificar tiles en los bordes izquierdo y derecho del jugador
+        for (int y = topTile; y <= bottomTile; y++) {
+            if (SOLID_TILES.contains(world[y][leftTile]) ||
+                    SOLID_TILES.contains(world[y][rightTile])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Verifica colisión hacia abajo (con el suelo)
+     */
+    private boolean checkCollisionDown(Player player, int[][] world) {
+        // Calcular el pixel exacto de la parte inferior del jugador
+        int bottomPixel = (int)(player.y + player.height);
+        int bottomTile = bottomPixel / SIZE_TILE;
+
+        int leftTile = (int)(player.x + 1) / SIZE_TILE; // +1 para evitar esquinas
+        int rightTile = (int)((player.x + player.width - 2) / SIZE_TILE); // -2 para evitar esquinas
+
+        // Verificar límites
+        if (bottomTile >= world.length) {
+            player.x = 100;
+            player.y = 100;
+            player.velocityY = 0;
+            player.isOnGround = false;
+            return false; // No hay colisión porque lo relocalizamos
+        }
+        if (leftTile < 0 || rightTile >= world[0].length) {
+            return false;
+        }
+
+        // Verificar tiles en la parte inferior del jugador
+        for (int x = leftTile; x <= rightTile; x++) {
+            if (SOLID_TILES.contains(world[bottomTile][x])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Verifica colisión hacia arriba (con el techo)
+     */
+    private boolean checkCollisionUp(Player player, int[][] world) {
+        int topTile = (int)(player.y / SIZE_TILE);
+        int leftTile = (int)(player.x / SIZE_TILE);
+        int rightTile = (int)((player.x + player.width - 1) / SIZE_TILE);
+
+        // Verificar límites
+        if (topTile < 0) {
+            return true;
+        }
+        if (leftTile < 0 || rightTile >= world[0].length) {
+            return false;
+        }
+
+        // Verificar tiles en la parte superior del jugador
+        for (int x = leftTile; x <= rightTile; x++) {
+            if (SOLID_TILES.contains(world[topTile][x])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private List<Map<String, String>> getRoomsList() {
+        List<Map<String, String>> roomsList = new ArrayList<>();
+        for (GameRoom room : rooms.values()) {
+            roomsList.add(Map.of(
+                    "id", room.id,
+                    "name", room.name,
+                    "players", String.valueOf(room.players.size())
+            ));
+        }
+        return roomsList;
+    }
+
+    private void broadcastToRoom(String roomId, String message) {
+        GameRoom room = rooms.get(roomId);
+        if (room != null) {
+            for (String userId : room.players.keySet()) {
+                User user = users.get(userId);
+                if (user != null) {
+                    sendToClient(user.connection, message);
+                }
+            }
+        }
+    }
+
+    private void broadcastToRoomExcept(String roomId, String exceptUserId, String message) {
+        GameRoom room = rooms.get(roomId);
+        if (room != null) {
+            for (String userId : room.players.keySet()) {
+                if (!userId.equals(exceptUserId)) {
+                    User user = users.get(userId);
+                    if (user != null) {
+                        sendToClient(user.connection, message);
+                    }
+                }
+            }
+        }
+    }
+
+    private void sendToClient(WebSocket conn, String message) {
+        if (conn.isOpen()) {
+            conn.send(message);
+        }
+    }
+
+    private void sendError(WebSocket conn, String error) {
+        sendToClient(conn, createMessage("error", Map.of("message", error)));
+    }
+
+    private String createMessage(String type, Map<String, ?> data) {
+        Map<String, Object> message = new HashMap<>();
+        message.put("type", type);
+        message.put("data", data);
+        message.put("timestamp", System.currentTimeMillis());
+        return gson.toJson(message);
+    }
+}
