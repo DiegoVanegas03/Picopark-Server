@@ -1,4 +1,4 @@
-package org.example;
+package org.server;
 
 import java.util.HashMap;
 import java.util.HashSet;

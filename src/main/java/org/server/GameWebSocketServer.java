@@ -1,4 +1,4 @@
-package org.example;
+package org.server;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
@@ -11,8 +11,6 @@ import java.io.File;
 import java.net.InetSocketAddress;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-
-import static org.example.GameRoom.loadMap;
 
 public class GameWebSocketServer extends WebSocketServer {
 
