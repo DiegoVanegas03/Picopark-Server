@@ -8,12 +8,15 @@ import java.util.Set;
 public class Player {
     String id;
     String username;
-    float x = 20;
+    float x = 300;
     float y = 20;
     float velocityY = 0;
     String direction = "stop";
     int moveDirection = 0; // -1 izquierda, 0 parado, 1 derecha
     boolean isOnGround = false;
+
+    boolean isVisible = true;
+
 
     float width = 32;  // Ancho del jugador
     float height = 48; // Alto del jugador
@@ -33,8 +36,7 @@ public class Player {
         data.put("direction", direction);
         data.put("x", x);
         data.put("y", y);
-        data.put("velocityY", velocityY);
-        data.put("isOnGround", isOnGround);
+        data.put("isVisible", isVisible);
         return data;
     }
 }

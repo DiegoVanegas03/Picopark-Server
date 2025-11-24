@@ -1,22 +1,33 @@
 package org.server;
 
-import java.io.File;
+import com.google.gson.Gson;
+import java.io.FileReader;
+import java.io.Reader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Scanner;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class GameRoom {
+    public boolean canUpdate = true;
     public String id;
     public String name;
     public int[][] world;
+    public int[][] gameWorld;
+    public int[][] waitingRoom;
     public Map<String, Player> players = new ConcurrentHashMap<>();
 
-    GameRoom(String id, String name, int[][] world) {
+    public int completedPlayers = 0;
+
+    public int needUsers;
+
+    GameRoom(String id, String name, int needUsers, int[][] world, int[][] waitingRoom) {
         this.id = id;
         this.name = name;
-        this.world = world;
+        this.world = waitingRoom;
+        this.gameWorld = world;
+        this.waitingRoom = waitingRoom;
+        this.needUsers = needUsers;
     }
 
     void addPlayer(Player player) {
@@ -39,53 +50,13 @@ public class GameRoom {
         return data;
     }
 
-    static class MapData {
-        String levelName;   // primera línea
-        String vh;          // segunda línea
-        String gv;          // tercera línea
-        int[][] world;      // matriz del mapa
-    }
-
-    public static MapData loadMap(File file) {
-        MapData data = new MapData();
-        List<int[]> rows = new ArrayList<>();
-
-        try (Scanner sc = new Scanner(file)) {
-
-            // ----- 1. NOMBRE DEL NIVEL -----
-            if (sc.hasNextLine()) {
-                data.levelName = sc.nextLine().trim();
-            }
-
-            // ----- 2. METADATA (opcional pero tú la tienes) -----
-            if (sc.hasNextLine()) {
-                data.vh = sc.nextLine().trim();  // ejemplo: "vh-30.0"
-            }
-            if (sc.hasNextLine()) {
-                data.gv = sc.nextLine().trim();  // ejemplo: "gv-9.0"
-            }
-
-            // ----- 3. MATRIZ DEL MUNDO -----
-            while (sc.hasNextLine()) {
-                String line = sc.nextLine().trim();
-                if (line.isEmpty()) continue;
-
-                String[] parts = line.split("\\s+");
-                int[] row = new int[parts.length];
-
-                for (int i = 0; i < parts.length; i++) {
-                    row[i] = Integer.parseInt(parts[i]);
-                }
-
-                rows.add(row);
-            }
-
-            data.world = rows.toArray(new int[0][]);
-
+    public static RoomConfig loadRoomConfig(String path) {
+        try (Reader reader = new FileReader(path)) {
+            Gson gson = new Gson();
+            return gson.fromJson(reader, RoomConfig.class);
         } catch (Exception e) {
             e.printStackTrace();
+            return null;
         }
-
-        return data;
     }
 }

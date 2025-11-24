@@ -11,6 +11,9 @@ import java.io.File;
 import java.net.InetSocketAddress;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class GameWebSocketServer extends WebSocketServer {
 
@@ -18,23 +21,21 @@ public class GameWebSocketServer extends WebSocketServer {
     private final Map<String, User> users = new ConcurrentHashMap<>();
     private final Map<String, GameRoom> rooms = new ConcurrentHashMap<>();
     private final Map<WebSocket, String> connectionToUserId = new ConcurrentHashMap<>();
-
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     private static final float GRAVITY = 0.5f;
-    private static final float JUMP_FORCE = -9f;
+    private static final float JUMP_FORCE = -10f;
 
-    //velociadad para 60
-    private static final float MOVE_SPEED = 5f;
+    private static final float MOVE_SPEED = 4.5f;
     private static final int GAME_TICK_RATE = 60; // 60 FPS
-
-    //private static final float MOVE_SPEED = 2f;
-    //private static final int GAME_TICK_RATE = 120; // 60 FPS
 
     private static final int ORIGINAL_SIZE_TILE = 16;
     private static final int SCALE = 3;
     private static final int SIZE_TILE = ORIGINAL_SIZE_TILE * SCALE; // 48 pixels
 
     private static final Set<Integer> SOLID_TILES = Set.of(3, 4, 5);
+
+    private static final Set<Integer> WINNER_TILES = Set.of(12,13,14);
 
     public GameWebSocketServer(int port) {
         super(new InetSocketAddress(port));
@@ -44,26 +45,22 @@ public class GameWebSocketServer extends WebSocketServer {
 
     private void initializeRooms() {
         File levelsDir = new File("maps");
-
-        String[] salas = levelsDir.list((dir, name) -> name.endsWith(".txt"));
+        String[] salas = levelsDir.list((dir, name) -> name.endsWith(".json"));
         if (salas == null) return;
 
         for (String sala : salas) {
-
             File mapFile = new File(levelsDir, sala);
-
-            GameRoom.MapData mapData = GameRoom.loadMap(mapFile);
-
-            String roomId = sala.replace(".txt", "");
-
+            RoomConfig config = GameRoom.loadRoomConfig(mapFile.getAbsolutePath());
+            String roomId = sala.replace(".json", "");
             rooms.put(roomId, new GameRoom(
                     roomId,
-                    mapData.levelName,   // ← ahora le pones el nombre del txt
-                    mapData.world        // ← y su matriz del mapa
+                    config.getRoomName(),   // ← ahora le pones el nombre del txt
+                    config.getUsersToStart(),
+                    config.getWorld(),        // ← y su matriz del mapa
+                    config.getWaitingRoom()
             ));
         }
     }
-
 
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
@@ -72,20 +69,8 @@ public class GameWebSocketServer extends WebSocketServer {
 
     @Override
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
-        String userId = connectionToUserId.remove(conn);
-        if (userId != null) {
-            User user = users.remove(userId);
-            if (user != null && user.currentRoom != null) {
-                GameRoom room = rooms.get(user.currentRoom);
-                if (room != null) {
-                    room.removePlayer(userId);
-                    broadcastToRoom(user.currentRoom, createMessage("playerLeft", Map.of(
-                            "userId", userId,
-                            "username", user.username
-                    )));
-                }
-            }
-        }
+        this.handleLeaveRoom(conn);
+        connectionToUserId.remove(conn);
         System.out.println("Conexión cerrada: " + conn.getRemoteSocketAddress());
     }
 
@@ -108,6 +93,7 @@ public class GameWebSocketServer extends WebSocketServer {
                     break;
                 case "leaveRoom":
                     handleLeaveRoom(conn);
+                    break;
                 case "move":
                     handleMove(conn, data);
                     break;
@@ -140,6 +126,14 @@ public class GameWebSocketServer extends WebSocketServer {
                     "userId", userId,
                     "username", user.username
             )));
+
+            oldRoom.completedPlayers = 0;
+
+            if(oldRoom.players.isEmpty())
+                oldRoom.world = oldRoom.waitingRoom;
+
+            if(!oldRoom.players.isEmpty() && oldRoom.players.size() < oldRoom.needUsers)
+                this.backToWaitingRoom(oldRoom);
         }
     }
 
@@ -231,6 +225,54 @@ public class GameWebSocketServer extends WebSocketServer {
                 "username", user.username,
                 "player", player.toMap()
         )));
+
+        if(room.players.size() >= room.needUsers)
+            this.startGame(room);
+    }
+
+    private void resetPlayers(GameRoom room, int offsetX) {
+        int index = 0;
+        for (Player player : room.players.values()) {
+            player.x = offsetX + 20 + (index * 100);
+            player.y = 20;
+            index++;
+        }
+    }
+
+    private void backToWaitingRoom(GameRoom room) {
+        scheduler.schedule(() -> {
+            room.world = room.waitingRoom;
+            resetPlayers(room,200);
+
+            broadcastToRoom(
+                    room.id,
+                    createMessage("startGame", Map.of("world", room.world))
+            );
+        }, 3, TimeUnit.SECONDS);
+    }
+
+    private void startGame(GameRoom room) {
+        scheduler.schedule(() -> {
+            room.world = room.gameWorld;
+            resetPlayers(room,0);
+
+            broadcastToRoom(
+                    room.id,
+                    createMessage("startGame", Map.of("world", room.world))
+            );
+        }, 3, TimeUnit.SECONDS);
+    }
+
+    private void restartGame(GameRoom room) {
+        scheduler.schedule(() -> {
+            resetPlayers(room,0);
+
+            broadcastToRoom(
+                    room.id,
+                    createMessage("restartGame", Map.of())
+            );
+            room.canUpdate = true;
+        }, 3, TimeUnit.SECONDS);
     }
 
     private void handleMove(WebSocket conn, JsonObject data) {
@@ -308,14 +350,16 @@ public class GameWebSocketServer extends WebSocketServer {
     }
     private void updateGame() {
         for (GameRoom room : rooms.values()) {
-            if (room.players.isEmpty()) continue;
+            if (room.players.isEmpty() || !room.canUpdate) continue;
 
             // Primero, limpiar la lista de jugadores encima de cada uno
             for (Player player : room.players.values()) {
+                if(!player.isVisible) continue;
                 player.playersOnTop.clear();
             }
 
             for (Player player : room.players.values()) {
+                if(!player.isVisible) continue;
                 // ========== MOVIMIENTO HORIZONTAL ==========
                 float oldX = player.x;
                 player.x += player.moveDirection * MOVE_SPEED;
@@ -347,7 +391,7 @@ public class GameWebSocketServer extends WebSocketServer {
 
                 // Verificar colisión hacia abajo (suelo)
                 if (player.velocityY > 0) {
-                    boolean tileCollision = checkCollisionDown(player, room.world);
+                    boolean tileCollision = checkCollisionDown(player, room.world, room);
                     Player playerBelow = checkPlayerCollisionDown(player, room);
 
                     if (tileCollision || playerBelow != null) {
@@ -384,6 +428,9 @@ public class GameWebSocketServer extends WebSocketServer {
                     // No hay colisión, está en el aire
                     player.isOnGround = false;
                 }
+
+                // ========== VERIFICAR TILES DE VICTORIA ==========
+                checkWinnerTiles(player, room);
             }
 
             // DESPUÉS de actualizar todas las posiciones, mover jugadores encima
@@ -411,6 +458,7 @@ public class GameWebSocketServer extends WebSocketServer {
                 }
             }
 
+
             // Enviar actualización a todos los jugadores en la sala
             broadcastToRoom(room.id, createMessage("gameUpdate", Map.of(
                     "players", room.getPlayersData()
@@ -419,11 +467,43 @@ public class GameWebSocketServer extends WebSocketServer {
     }
 
     /**
+     Verifica si el jugador está atravesando tiles de victoria
+     **/
+    private void checkWinnerTiles(Player player, GameRoom room) {
+        if(!player.isVisible) return;
+        // Calcular los tiles que ocupa el jugador
+        int leftTile = (int)(player.x / SIZE_TILE);
+        int rightTile = (int)((player.x + player.width - 1) / SIZE_TILE);
+        int topTile = (int)(player.y / SIZE_TILE);
+        int bottomTile = (int)((player.y + player.height - 1) / SIZE_TILE);
+
+        // Verificar límites
+        if (leftTile < 0 || rightTile >= room.world[0].length ||
+                topTile < 0 || bottomTile >= room.world.length) {
+            return;
+        }
+
+        // Verificar cada tile que ocupa el jugador
+        for (int y = topTile; y <= bottomTile; y++) {
+            for (int x = leftTile; x <= rightTile; x++) {
+                if (WINNER_TILES.contains(room.world[y][x])) {
+                    player.isVisible = false;
+                    room.completedPlayers++;
+                    if (room.completedPlayers >= room.players.size()) {
+                        broadcastToRoom(room.id, createMessage("gameWin", Map.of()));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
      * Verifica colisión horizontal con otros jugadores
      */
     private Player checkPlayerCollisionHorizontal(Player player, GameRoom room) {
         for (Player other : room.players.values()) {
-            if (other.id.equals(player.id)) continue;
+            if (other.id.equals(player.id) || !other.isVisible) continue;
 
             // Verificar si los bounding boxes se superponen
             if (player.x < other.x + other.width &&
@@ -489,7 +569,7 @@ public class GameWebSocketServer extends WebSocketServer {
     /**
      * Verifica colisión hacia abajo (con el suelo)
      */
-    private boolean checkCollisionDown(Player player, int[][] world) {
+    private boolean checkCollisionDown(Player player, int[][] world, GameRoom room) {
         // Calcular el pixel exacto de la parte inferior del jugador
         int bottomPixel = (int)(player.y + player.height);
         int bottomTile = bottomPixel / SIZE_TILE;
@@ -499,10 +579,12 @@ public class GameWebSocketServer extends WebSocketServer {
 
         // Verificar límites
         if (bottomTile >= world.length) {
-            player.x = 100;
-            player.y = 100;
             player.velocityY = 0;
             player.isOnGround = false;
+            room.canUpdate = false;
+            this.broadcastToRoom(room.id,
+                    createMessage("gameOver", Map.of("userName",player.username)));
+            this.restartGame(room);
             return false; // No hay colisión porque lo relocalizamos
         }
         if (leftTile < 0 || rightTile >= world[0].length) {
