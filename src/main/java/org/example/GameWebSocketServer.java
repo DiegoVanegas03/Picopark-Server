@@ -108,6 +108,8 @@ public class GameWebSocketServer extends WebSocketServer {
                 case "joinRoom":
                     handleJoinRoom(conn, data);
                     break;
+                case "leaveRoom":
+                    handleLeaveRoom(conn);
                 case "move":
                     handleMove(conn, data);
                     break;
@@ -123,6 +125,23 @@ public class GameWebSocketServer extends WebSocketServer {
         } catch (Exception e) {
             sendError(conn, "Error procesando mensaje: " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+
+    private void handleLeaveRoom(WebSocket conn) {
+        String userId = connectionToUserId.get(conn);
+        if (userId == null) {
+            sendError(conn, "No autenticado");
+            return;
+        }
+        User user = users.get(userId);
+        GameRoom oldRoom = rooms.get(user.currentRoom);
+        if (oldRoom != null) {
+            oldRoom.removePlayer(userId);
+            broadcastToRoom(user.currentRoom, createMessage("playerLeft", Map.of(
+                    "userId", userId,
+                    "username", user.username
+            )));
         }
     }
 
@@ -243,9 +262,24 @@ public class GameWebSocketServer extends WebSocketServer {
         GameRoom room = rooms.get(user.currentRoom);
         Player player = room.getPlayer(userId);
 
-        if (player != null && player.isOnGround) {
-            player.velocityY = JUMP_FORCE;
-            player.isOnGround = false;
+        if (player != null) {
+            System.out.println("Intento de salto - Usuario: " + user.username +
+                    ", isOnGround: " + player.isOnGround +
+                    ", playersOnTop: " + player.playersOnTop.size());
+
+            // Solo puede saltar si está en el suelo Y no tiene a nadie encima
+            if (player.isOnGround && player.playersOnTop.isEmpty()) {
+                player.velocityY = JUMP_FORCE;
+                player.isOnGround = false;
+                System.out.println("✓ Salto permitido para: " + user.username);
+            } else {
+                if (!player.isOnGround) {
+                    System.out.println("✗ Salto bloqueado: No está en el suelo");
+                }
+                if (!player.playersOnTop.isEmpty()) {
+                    System.out.println("✗ Salto bloqueado: Tiene " + player.playersOnTop.size() + " jugador(es) encima");
+                }
+            }
         }
     }
 
@@ -274,18 +308,29 @@ public class GameWebSocketServer extends WebSocketServer {
             }
         }, 0, 1000 / GAME_TICK_RATE);
     }
-
     private void updateGame() {
         for (GameRoom room : rooms.values()) {
             if (room.players.isEmpty()) continue;
 
+            // Primero, limpiar la lista de jugadores encima de cada uno
+            for (Player player : room.players.values()) {
+                player.playersOnTop.clear();
+            }
+
             for (Player player : room.players.values()) {
                 // ========== MOVIMIENTO HORIZONTAL ==========
+                float oldX = player.x;
                 player.x += player.moveDirection * MOVE_SPEED;
 
-                // Verificar colisión horizontal
+                // Verificar colisión horizontal con tiles
                 if (checkCollisionHorizontal(player, room.world)) {
                     player.x -= player.moveDirection * MOVE_SPEED; // Revertir
+                }
+
+                // Verificar colisión horizontal con otros jugadores
+                Player collidedPlayer = checkPlayerCollisionHorizontal(player, room);
+                if (collidedPlayer != null) {
+                    player.x = oldX; // Revertir movimiento
                 }
 
                 // Limitar a los límites del mundo
@@ -303,14 +348,30 @@ public class GameWebSocketServer extends WebSocketServer {
                 player.y += player.velocityY;
 
                 // Verificar colisión hacia abajo (suelo)
-                if (player.velocityY > 0 && checkCollisionDown(player, room.world)) {
-                    // Ajustar posición al tile más cercano
-                    int bottomPixel = (int)(player.y + player.height);
-                    int tileY = bottomPixel / SIZE_TILE;
-                    player.y = (tileY * SIZE_TILE) - player.height;
+                if (player.velocityY > 0) {
+                    boolean tileCollision = checkCollisionDown(player, room.world);
+                    Player playerBelow = checkPlayerCollisionDown(player, room);
 
-                    player.velocityY = 0;
-                    player.isOnGround = true;
+                    if (tileCollision || playerBelow != null) {
+                        // Ajustar posición
+                        int bottomPixel = (int)(player.y + player.height);
+                        int tileY = bottomPixel / SIZE_TILE;
+
+                        if (playerBelow != null) {
+                            // Ajustar encima del otro jugador
+                            player.y = playerBelow.y - player.height;
+                            // Registrar que este jugador está encima del otro
+                            playerBelow.playersOnTop.add(player.id);
+                        } else {
+                            // Ajustar encima del tile
+                            player.y = (tileY * SIZE_TILE) - player.height;
+                        }
+
+                        player.velocityY = 0;
+                        player.isOnGround = true;
+                    } else {
+                        player.isOnGround = false;
+                    }
                 }
                 // Verificar colisión hacia arriba (techo)
                 else if (player.velocityY < 0 && checkCollisionUp(player, room.world)) {
@@ -319,10 +380,36 @@ public class GameWebSocketServer extends WebSocketServer {
                     player.y = tileY * SIZE_TILE;
 
                     player.velocityY = 0;
+                    player.isOnGround = false;
                 }
                 else {
                     // No hay colisión, está en el aire
                     player.isOnGround = false;
+                }
+            }
+
+            // DESPUÉS de actualizar todas las posiciones, mover jugadores encima
+            for (Player player : room.players.values()) {
+                if (!player.playersOnTop.isEmpty()) {
+                    // Este jugador tiene gente encima, moverlos
+                    for (String playerOnTopId : player.playersOnTop) {
+                        Player playerOnTop = room.getPlayer(playerOnTopId);
+                        if (playerOnTop != null) {
+                            // Mover horizontalmente con el jugador base
+                            float deltaX = player.x - playerOnTop.x + (player.width / 2) - (playerOnTop.width / 2);
+
+                            // Solo aplicar el movimiento si es significativo
+                            if (Math.abs(deltaX) > 0.5f) {
+                                playerOnTop.x += deltaX * 0.3f; // Suavizado
+                            }
+
+                            // Mantener encima (ajustar Y si es necesario)
+                            playerOnTop.y = player.y - playerOnTop.height;
+
+                            // Limitar para que no salga del mundo
+                            playerOnTop.x = Math.max(0, Math.min(room.world[0].length * SIZE_TILE - playerOnTop.width, playerOnTop.x));
+                        }
+                    }
                 }
             }
 
@@ -331,6 +418,50 @@ public class GameWebSocketServer extends WebSocketServer {
                     "players", room.getPlayersData()
             )));
         }
+    }
+
+    /**
+     * Verifica colisión horizontal con otros jugadores
+     */
+    private Player checkPlayerCollisionHorizontal(Player player, GameRoom room) {
+        for (Player other : room.players.values()) {
+            if (other.id.equals(player.id)) continue;
+
+            // Verificar si los bounding boxes se superponen
+            if (player.x < other.x + other.width &&
+                    player.x + player.width > other.x &&
+                    player.y < other.y + other.height &&
+                    player.y + player.height > other.y) {
+                return other;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Verifica colisión vertical con otros jugadores (cuando cae encima)
+     */
+    private Player checkPlayerCollisionDown(Player player, GameRoom room) {
+        for (Player other : room.players.values()) {
+            if (other.id.equals(player.id)) continue;
+
+            // Verificar si está cayendo encima de otro jugador
+            float playerBottom = player.y + player.height;
+            float otherTop = other.y;
+
+            // Verificar superposición horizontal (debe estar bien alineado)
+            boolean horizontalOverlap = player.x + 2 < other.x + other.width &&
+                    player.x + player.width - 2 > other.x;
+
+            // Verificar si está justo encima (margen más amplio para detectar mejor)
+            boolean verticalNear = playerBottom >= otherTop - 5 &&
+                    playerBottom <= otherTop + 15;
+
+            if (horizontalOverlap && verticalNear && player.velocityY >= 0) {
+                return other;
+            }
+        }
+        return null;
     }
 
     private boolean checkCollisionHorizontal(Player player, int[][] world) {
