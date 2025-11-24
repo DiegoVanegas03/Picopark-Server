@@ -1,4 +1,4 @@
-package org.example;
+package org.server;
 
 import org.java_websocket.WebSocket;
 
